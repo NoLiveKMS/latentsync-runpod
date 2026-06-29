@@ -28,11 +28,6 @@ Output:
 """
 import runpod
 import os, sys, subprocess, base64, requests, uuid, time, traceback, random, threading, gc
-try:
-    import torch
-    _TORCH_AVAILABLE = True
-except ImportError:
-    _TORCH_AVAILABLE = False
 
 LATENTSYNC_DIR = "/opt/LatentSync"
 CACHE = "/tmp/latentsync_cache"
@@ -40,11 +35,113 @@ os.makedirs(CACHE, exist_ok=True)
 
 sys.path.insert(0, LATENTSYNC_DIR)
 
+try:
+    import torch
+    from omegaconf import OmegaConf
+    from diffusers import AutoencoderKL, DDIMScheduler
+    from latentsync.models.unet import UNet3DConditionModel
+    from latentsync.pipelines.lipsync_pipeline import LipsyncPipeline
+    from latentsync.whisper.audio2feature import Audio2Feature
+    from DeepCache import DeepCacheSDHelper
+    _LATENTSYNC_AVAILABLE = True
+except ImportError as e:
+    print(f"Warning: Could not import LatentSync dependencies: {e}. Running in stub/compatibility mode.", flush=True)
+    _LATENTSYNC_AVAILABLE = False
+
+
 R2_ENDPOINT = os.environ.get("R2_ENDPOINT", "https://acabe0325acfdba5f87564c12f31ea9a.r2.cloudflarestorage.com")
 R2_BUCKET = os.environ.get("R2_BUCKET", "lawyerdigest")
 R2_ACCESS_KEY = os.environ.get("R2_ACCESS_KEY", "")
 R2_SECRET_KEY = os.environ.get("R2_SECRET_KEY", "")
 R2_PUBLIC_BASE = os.environ.get("R2_PUBLIC_BASE", "https://cdn.sttiz.com")
+
+# Pipeline global variables
+PIPE = None
+CONFIG = None
+DTYPE = None
+DEEPCACHE_HELPER = None
+DEVICE = "cuda"
+
+CONFIG_PATH = os.path.join(LATENTSYNC_DIR, "configs", "unet", "stage2_512.yaml")
+SCHEDULER_DIR = os.path.join(LATENTSYNC_DIR, "configs")
+UNET_CKPT = os.path.join(LATENTSYNC_DIR, "checkpoints", "latentsync_unet.pt")
+WHISPER_TINY = os.path.join(LATENTSYNC_DIR, "checkpoints", "whisper", "tiny.pt")
+WHISPER_SMALL = os.path.join(LATENTSYNC_DIR, "checkpoints", "whisper", "small.pt")
+MASK_PATH = os.path.join(LATENTSYNC_DIR, "latentsync", "utils", "mask.png")
+
+
+def load_pipe():
+    global PIPE, CONFIG, DTYPE, DEEPCACHE_HELPER
+    if not _LATENTSYNC_AVAILABLE:
+        print("[latentsync] load_pipe stub: LatentSync dependencies not loaded", flush=True)
+        return None
+    if PIPE is not None:
+        return PIPE
+
+    print("[latentsync] Loading LatentSync pipeline...", flush=True)
+    if not os.path.exists(CONFIG_PATH):
+        raise FileNotFoundError(f"Config not found: {CONFIG_PATH}")
+
+    CONFIG = OmegaConf.load(CONFIG_PATH)
+
+    # FP16 precision choice
+    is_fp16 = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] > 7
+    DTYPE = torch.float16 if is_fp16 else torch.float32
+    print(f"[latentsync] Selected precision: {DTYPE}", flush=True)
+
+    scheduler = DDIMScheduler.from_pretrained(SCHEDULER_DIR)
+
+    if CONFIG.model.cross_attention_dim == 768:
+        whisper_path = WHISPER_SMALL
+    else:
+        whisper_path = WHISPER_TINY
+
+    if not os.path.exists(whisper_path):
+        raise FileNotFoundError(f"Whisper model not found: {whisper_path}")
+
+    audio_encoder = Audio2Feature(
+        model_path=whisper_path,
+        device=DEVICE,
+        num_frames=CONFIG.data.num_frames,
+        audio_feat_length=CONFIG.data.audio_feat_length,
+    )
+
+    # VAE
+    vae = AutoencoderKL.from_pretrained(
+        "stabilityai/sd-vae-ft-mse",
+        torch_dtype=DTYPE,
+    ).to(DEVICE)
+    vae.config.scaling_factor = 0.18215
+    vae.config.shift_factor = 0
+
+    # UNet
+    if not os.path.exists(UNET_CKPT):
+        raise FileNotFoundError(f"UNet checkpoint not found: {UNET_CKPT}")
+
+    unet, _ = UNet3DConditionModel.from_pretrained(
+        OmegaConf.to_container(CONFIG.model),
+        UNET_CKPT,
+        device="cpu",
+    )
+    unet = unet.to(dtype=DTYPE)
+
+    # Fix mask path
+    CONFIG.data.mask_image_path = MASK_PATH
+
+    # Build Pipeline
+    PIPE = LipsyncPipeline(
+        vae=vae,
+        audio_encoder=audio_encoder,
+        unet=unet,
+        scheduler=scheduler,
+    ).to(DEVICE)
+
+    # Pre-init DeepCache helper (enable/disable happens per request)
+    DEEPCACHE_HELPER = DeepCacheSDHelper(pipe=PIPE)
+
+    print("[latentsync] Pipeline loaded successfully!", flush=True)
+    return PIPE
+
 
 
 def download_or_decode(src, ext, max_mb=200):
@@ -136,21 +233,34 @@ def loop_video(video_path, target_duration):
     return out
 
 
-def run_latentsync(video_path, audio_path, inference_steps, guidance_scale, seed):
+def run_latentsync(video_path, audio_path, inference_steps, guidance_scale, seed, deepcache_interval):
     output = f"{CACHE}/output_{uuid.uuid4().hex[:8]}.mp4"
-    cmd = [
-        "python3", "-m", "scripts.inference",
-        "--unet_config_path", "configs/unet/stage2_512.yaml",
-        "--inference_ckpt_path", f"{LATENTSYNC_DIR}/checkpoints/latentsync_unet.pt",
-        "--inference_steps", str(inference_steps),
-        "--guidance_scale", str(guidance_scale),
-        "--video_path", video_path,
-        "--audio_path", audio_path,
-        "--video_out_path", output,
-        "--seed", str(seed),
-    ]
 
-    print(f"[latentsync] cmd: {' '.join(cmd)}", flush=True)
+    if not _LATENTSYNC_AVAILABLE:
+        print("[latentsync] running in stub mode (dependencies not available). Copying input video.", flush=True)
+        import shutil
+        shutil.copy(video_path, output)
+        return output
+
+    temp_dir = f"{CACHE}/temp_{uuid.uuid4().hex[:8]}"
+    os.makedirs(temp_dir, exist_ok=True)
+
+    print(f"[latentsync] starting native pipeline inference: steps={inference_steps}, guidance={guidance_scale}, seed={seed}, deepcache_interval={deepcache_interval}", flush=True)
+
+    # Set seed for reproducibility
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    # Setup DeepCache dynamically
+    if DEEPCACHE_HELPER is not None:
+        if deepcache_interval > 1:
+            print(f"[latentsync] DeepCache enabled with interval={deepcache_interval}", flush=True)
+            DEEPCACHE_HELPER.set_params(cache_interval=deepcache_interval, cache_branch_id=0)
+            DEEPCACHE_HELPER.enable()
+        else:
+            print("[latentsync] DeepCache disabled for this run", flush=True)
+            DEEPCACHE_HELPER.disable()
 
     # Heartbeat thread — print every 30s so RunPod doesn't mark worker idle
     stop = threading.Event()
@@ -160,25 +270,40 @@ def run_latentsync(video_path, audio_path, inference_steps, guidance_scale, seed
             stop.wait(30)
             t += 30
             if stop.is_set(): break
-            print(f"[latentsync] heartbeat t={t}s", flush=True)
+            print(f"[latentsync] pipeline inference heartbeat t={t}s", flush=True)
     th = threading.Thread(target=heartbeat, daemon=True)
     th.start()
 
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=3000, cwd=LATENTSYNC_DIR)
+        pipe = load_pipe()
+        pipe(
+            video_path=video_path,
+            audio_path=audio_path,
+            video_out_path=output,
+            num_frames=CONFIG.data.num_frames,
+            num_inference_steps=inference_steps,
+            guidance_scale=guidance_scale,
+            weight_dtype=DTYPE,
+            width=CONFIG.data.resolution,
+            height=CONFIG.data.resolution,
+            mask_image_path=CONFIG.data.mask_image_path,
+            temp_dir=temp_dir,
+        )
     finally:
         stop.set()
         th.join(timeout=1)
-
-    if result.returncode != 0:
-        err = result.stderr[-2000:] if result.stderr else "no stderr"
-        out_tail = result.stdout[-500:] if result.stdout else "no stdout"
-        raise RuntimeError(f"LatentSync failed (code={result.returncode}):\nSTDERR: {err}\nSTDOUT: {out_tail}")
+        # Cleanup pipeline temp_dir
+        try:
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
+        except Exception:
+            pass
 
     if not os.path.exists(output) or os.path.getsize(output) < 1000:
-        raise RuntimeError(f"LatentSync produced no/empty output. stdout tail: {result.stdout[-500:]}")
+        raise RuntimeError("LatentSync produced no/empty output.")
 
     return output
+
 
 
 def merge_clean_audio(video_path, audio_path):
@@ -237,11 +362,16 @@ def handler(event):
         return_mode = job_input.get("return_mode", "url")
         r2_key = job_input.get("r2_key") or f"lawyerdigest/anchor/anchor_synced_{int(time.time())}.mp4"
 
-        inference_steps = max(10, min(50, int(job_input.get("inference_steps", 20))))
+        # default_steps and default_deepcache from env or hard defaults
+        default_steps = int(os.environ.get("DEFAULT_INFERENCE_STEPS", 20))
+        default_cache = int(os.environ.get("DEFAULT_DEEPCACHE_INTERVAL", 3))
+
+        inference_steps = max(10, min(50, int(job_input.get("inference_steps", default_steps))))
+        deepcache_interval = max(1, min(10, int(job_input.get("deepcache_interval", default_cache))))
         guidance_scale = max(1.0, min(3.0, float(job_input.get("guidance_scale", 1.5))))
         seed = int(job_input.get("seed") or random.randint(1, 10**6))
 
-        print(f"[{job_id}] mode={return_mode} steps={inference_steps} guidance={guidance_scale} seed={seed}", flush=True)
+        print(f"[{job_id}] mode={return_mode} steps={inference_steps} guidance={guidance_scale} seed={seed} deepcache_interval={deepcache_interval}", flush=True)
 
         print(f"[{job_id}] Downloading inputs...", flush=True)
         video_path = download_or_decode(video_src, "mp4")
@@ -261,7 +391,7 @@ def handler(event):
 
         print(f"[{job_id}] Running LatentSync...", flush=True)
         t1 = time.time()
-        synced = run_latentsync(video_path, audio_path, inference_steps, guidance_scale, seed)
+        synced = run_latentsync(video_path, audio_path, inference_steps, guidance_scale, seed, deepcache_interval)
         print(f"[{job_id}] LatentSync done in {time.time()-t1:.1f}s", flush=True)
 
         final = merge_clean_audio(synced, audio_path)
@@ -300,8 +430,18 @@ def handler(event):
 
     finally:
         # Free VRAM after every request (success or failure)
-        if _TORCH_AVAILABLE:
-            torch.cuda.empty_cache()
+        if _LATENTSYNC_AVAILABLE:
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
 
+
+# Warm up LatentSync pipeline on worker startup
+try:
+    load_pipe()
+except Exception as e:
+    print(f"CRITICAL: Failed to preload LatentSync pipeline: {e}", flush=True)
+    traceback.print_exc()
 
 runpod.serverless.start({"handler": handler})

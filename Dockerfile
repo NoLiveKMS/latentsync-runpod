@@ -74,6 +74,12 @@ snapshot_download(repo_id='ByteDance/LatentSync-1.6', \
     local_dir_use_symlinks=False, \
     max_workers=4)"
 
+# Pre-download StabilityAI VAE checkpoint (~330MB)
+RUN python3 -c "\
+from diffusers import AutoencoderKL; \
+AutoencoderKL.from_pretrained('stabilityai/sd-vae-ft-mse')"
+
+
 # Pre-warm insightface's buffalo_l model pack (downloads on first use otherwise)
 RUN python3 -c "\
 import insightface; \
