@@ -10,6 +10,8 @@ Fixes in this revision:
   6. Progress heartbeats every 30s so RunPod doesn't mark idle.
   7. Inference steps/guidance clamped; seed randomised per call if missing.
   8. Clean output directory after return to keep disk under control.
+  9. loop_video: NVENC GPU encoder with automatic CPU fallback if NVENC unavailable.
+  10. handler: torch.cuda.empty_cache() in finally to prevent VRAM accumulation.
 
 Input:
   video_url: https://...mp4 (required)
@@ -26,6 +28,11 @@ Output:
 """
 import runpod
 import os, sys, subprocess, base64, requests, uuid, time, traceback, random, threading, gc
+try:
+    import torch
+    _TORCH_AVAILABLE = True
+except ImportError:
+    _TORCH_AVAILABLE = False
 
 LATENTSYNC_DIR = "/opt/LatentSync"
 CACHE = "/tmp/latentsync_cache"
@@ -70,18 +77,40 @@ def get_duration(path):
         return 0
 
 
+def _nvenc_usable():
+    """Check if NVIDIA hardware encoder is available on this machine."""
+    try:
+        out = subprocess.check_output(
+            ["nvidia-smi", "-q"], stderr=subprocess.DEVNULL
+        ).decode()
+        return "Encoder" in out
+    except Exception:
+        return False
+
+
+def _video_codec_args():
+    """Return FFmpeg codec args: h264_nvenc if GPU available, libx264 fallback."""
+    if _nvenc_usable():
+        print("[ffmpeg] Using h264_nvenc (GPU)", flush=True)
+        return ["-c:v", "h264_nvenc", "-rc", "vbr", "-cq", "20", "-preset", "fast"]
+    else:
+        print("[ffmpeg] NVENC unavailable — falling back to libx264 (CPU)", flush=True)
+        return ["-c:v", "libx264", "-crf", "20", "-preset", "veryfast"]
+
+
 def loop_video(video_path, target_duration):
     """Loop with re-encode (robust), then hard-trim to target duration."""
     video_dur = get_duration(video_path)
     if abs(video_dur - target_duration) < 0.5:
         return video_path
 
+    codec_args = _video_codec_args()
     out = f"{CACHE}/looped_{uuid.uuid4().hex[:8]}.mp4"
+
     if video_dur >= target_duration:
-        # ИСПРАВЛЕНО: h264_nvenc — аппаратный энкодер GPU вместо CPU libx264
         subprocess.run([
             "ffmpeg", "-y", "-i", video_path, "-t", f"{target_duration:.3f}",
-            "-c:v", "h264_nvenc", "-rc", "vbr", "-cq", "20", "-preset", "fast",
+            *codec_args,
             "-c:a", "aac", "-b:a", "128k",
             out
         ], capture_output=True, check=False)
@@ -94,11 +123,10 @@ def loop_video(video_path, target_duration):
             f.write(f"file '{video_path}'\n")
 
     # Re-encode on concat (not -c copy) so GOP boundaries don't truncate
-    # ИСПРАВЛЕНО: h264_nvenc — аппаратный энкодер GPU вместо CPU libx264
     subprocess.run([
         "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file,
         "-t", f"{target_duration:.3f}",
-        "-c:v", "h264_nvenc", "-rc", "vbr", "-cq", "20", "-preset", "fast",
+        *codec_args,
         "-c:a", "aac", "-b:a", "128k",
         out
     ], capture_output=True, check=False)
@@ -269,6 +297,11 @@ def handler(event):
         tb = traceback.format_exc()
         print(f"[{job_id}] ERROR: {e}\n{tb}", flush=True)
         return {"error": str(e), "traceback": tb[-2000:]}
+
+    finally:
+        # Free VRAM after every request (success or failure)
+        if _TORCH_AVAILABLE:
+            torch.cuda.empty_cache()
 
 
 runpod.serverless.start({"handler": handler})
