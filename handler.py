@@ -78,9 +78,10 @@ def loop_video(video_path, target_duration):
 
     out = f"{CACHE}/looped_{uuid.uuid4().hex[:8]}.mp4"
     if video_dur >= target_duration:
+        # ИСПРАВЛЕНО: h264_nvenc — аппаратный энкодер GPU вместо CPU libx264
         subprocess.run([
             "ffmpeg", "-y", "-i", video_path, "-t", f"{target_duration:.3f}",
-            "-c:v", "libx264", "-crf", "17", "-preset", "veryfast",
+            "-c:v", "h264_nvenc", "-rc", "vbr", "-cq", "20", "-preset", "fast",
             "-c:a", "aac", "-b:a", "128k",
             out
         ], capture_output=True, check=False)
@@ -93,10 +94,11 @@ def loop_video(video_path, target_duration):
             f.write(f"file '{video_path}'\n")
 
     # Re-encode on concat (not -c copy) so GOP boundaries don't truncate
+    # ИСПРАВЛЕНО: h264_nvenc — аппаратный энкодер GPU вместо CPU libx264
     subprocess.run([
         "ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", concat_file,
         "-t", f"{target_duration:.3f}",
-        "-c:v", "libx264", "-crf", "17", "-preset", "veryfast",
+        "-c:v", "h264_nvenc", "-rc", "vbr", "-cq", "20", "-preset", "fast",
         "-c:a", "aac", "-b:a", "128k",
         out
     ], capture_output=True, check=False)
