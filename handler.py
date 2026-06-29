@@ -260,7 +260,11 @@ def run_latentsync(video_path, audio_path, inference_steps, guidance_scale, seed
             DEEPCACHE_HELPER.enable()
         else:
             print("[latentsync] DeepCache disabled for this run", flush=True)
-            DEEPCACHE_HELPER.disable()
+            if hasattr(DEEPCACHE_HELPER, "function_dict"):
+                try:
+                    DEEPCACHE_HELPER.disable()
+                except Exception as e:
+                    print(f"[latentsync] Warning: Failed to disable DeepCache: {e}", flush=True)
 
     # Heartbeat thread — print every 30s so RunPod doesn't mark worker idle
     stop = threading.Event()
