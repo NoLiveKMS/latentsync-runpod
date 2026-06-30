@@ -47,9 +47,11 @@ def _nvenc_usable():
         return False
 
 
-# --- GLOBAL VARIABLES FOR OCCLUSION TRACKING ---
+# --- GLOBAL VARIABLES FOR OCCLUSION AND FACE TRACKING ---
 CURRENT_FRAME_COUNTER = 0
 CURRENT_OCCLUSION_MASK = []
+LAST_VALID_BBOX = None
+LAST_VALID_LMK = None
 
 try:
     import torch
@@ -65,6 +67,7 @@ try:
     import latentsync.utils.util
     import latentsync.pipelines.lipsync_pipeline
     import latentsync.utils.image_processor
+    import latentsync.utils.face_detector
 
     # Patch 1: Bypass CPU-bound FPS resampling in read_video (we prep video at 25 FPS on GPU)
     _orig_read_video = latentsync.utils.util.read_video
@@ -120,6 +123,24 @@ try:
                 raise RuntimeError("No faces detected in the video. Please make sure the video contains a visible face.") from e
             raise e
     latentsync.pipelines.lipsync_pipeline.LipsyncPipeline.affine_transform_video = patched_affine_transform_video
+
+    # Patch 5: Caching and auto-recovery for face landmarks to prevent 'Face not detected' crashes
+    _orig_face_detector_call = latentsync.utils.face_detector.FaceDetector.__call__
+    def patched_face_detector_call(self, frame, threshold=0.5):
+        global LAST_VALID_BBOX, LAST_VALID_LMK
+        bbox, lmk = _orig_face_detector_call(self, frame, threshold=threshold)
+
+        if bbox is not None:
+            LAST_VALID_BBOX = bbox
+            LAST_VALID_LMK = lmk
+            return bbox, lmk
+
+        if LAST_VALID_BBOX is not None:
+            # Re-use the cached landmarks to recover from temporary face detection loss
+            return LAST_VALID_BBOX, LAST_VALID_LMK
+
+        return None, None
+    latentsync.utils.face_detector.FaceDetector.__call__ = patched_face_detector_call
 
 except ImportError as e:
     print(f"Warning: Could not import LatentSync dependencies: {e}. Running in stub/compatibility mode.", flush=True)
@@ -459,8 +480,10 @@ def detect_video_occlusion(video_path):
 
 
 def run_latentsync(video_path, audio_path, inference_steps, guidance_scale, seed, deepcache_interval):
-    global CURRENT_FRAME_COUNTER, CURRENT_OCCLUSION_MASK
+    global CURRENT_FRAME_COUNTER, CURRENT_OCCLUSION_MASK, LAST_VALID_BBOX, LAST_VALID_LMK
     CURRENT_FRAME_COUNTER = 0
+    LAST_VALID_BBOX = None
+    LAST_VALID_LMK = None
     CURRENT_OCCLUSION_MASK = detect_video_occlusion(video_path)
 
     output = f"{CACHE}/output_{uuid.uuid4().hex[:8]}.mp4"
