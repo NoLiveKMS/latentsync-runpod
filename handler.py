@@ -142,6 +142,233 @@ try:
         return None, None
     latentsync.utils.face_detector.FaceDetector.__call__ = patched_face_detector_call
 
+    # Patch 6: Batched inference for LipsyncPipeline.__call__ to massive speedup
+    def batched_call(
+        self,
+        video_path: str,
+        audio_path: str,
+        video_out_path: str,
+        video_mask_path: str = None,
+        num_frames: int = 16,
+        video_fps: int = 25,
+        audio_sample_rate: int = 16000,
+        height: Optional[int] = None,
+        width: Optional[int] = None,
+        num_inference_steps: int = 20,
+        guidance_scale: float = 1.5,
+        weight_dtype: Optional[torch.dtype] = torch.float16,
+        eta: float = 0.0,
+        mask: str = "fix_mask",
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        callback: Optional[Callable[[int, int, torch.FloatTensor], None]] = None,
+        callback_steps: Optional[int] = 1,
+        **kwargs,
+    ):
+        from typing import Optional, Union, List, Callable
+        from einops import rearrange
+        import tqdm
+        import soundfile as sf
+        import shutil
+        from latentsync.utils.image_processor import ImageProcessor
+        from latentsync.utils.util import read_audio, write_video
+
+        # We can pass custom batch_size via kwargs or read from env or default to 4
+        inference_batch_size = kwargs.get("batch_size") or int(os.environ.get("INFERENCE_BATCH_SIZE", 4))
+        print(f"[latentsync patch] Running batched inference with batch_size={inference_batch_size}", flush=True)
+
+        is_train = self.unet.training
+        self.unet.eval()
+
+        # 0. Define call parameters
+        device = self._execution_device
+        self.image_processor = ImageProcessor(height, mask=mask, device="cuda")
+        self.set_progress_bar_config(desc=f"Sample frames: {num_frames}")
+
+        video_frames, original_video_frames, boxes, affine_matrices = self.affine_transform_video(video_path)
+        audio_samples = read_audio(audio_path)
+
+        # 1. Default height and width to unet
+        height = height or self.unet.config.sample_size * self.vae_scale_factor
+        width = width or self.unet.config.sample_size * self.vae_scale_factor
+
+        # 2. Check inputs
+        self.check_inputs(height, width, callback_steps)
+
+        do_classifier_free_guidance = guidance_scale > 1.0
+
+        # 3. set timesteps
+        self.scheduler.set_timesteps(num_inference_steps, device=device)
+        timesteps = self.scheduler.timesteps
+
+        # 4. Prepare extra step kwargs.
+        extra_step_kwargs = self.prepare_extra_step_kwargs(generator, eta)
+
+        self.video_fps = video_fps
+
+        if self.unet.add_audio_layer:
+            whisper_feature = self.audio_encoder.audio2feat(audio_path)
+            whisper_chunks = self.audio_encoder.feature2chunks(feature_array=whisper_feature, fps=video_fps)
+
+            num_inferences = min(len(video_frames), len(whisper_chunks)) // num_frames
+        else:
+            num_inferences = len(video_frames) // num_frames
+
+        synced_video_frames = []
+        masked_video_frames = []
+
+        num_channels_latents = self.vae.config.latent_channels
+
+        # Prepare latent variables
+        all_latents = self.prepare_latents(
+            1,
+            num_frames * num_inferences,
+            num_channels_latents,
+            height,
+            width,
+            weight_dtype,
+            device,
+            generator,
+        )
+
+        for i in tqdm.tqdm(range(0, num_inferences, inference_batch_size), desc="Doing inference..."):
+            bs = min(inference_batch_size, num_inferences - i)
+            
+            # Prepare audio embeds for all bs chunks
+            if self.unet.add_audio_layer:
+                audio_embeds_list = []
+                for k in range(bs):
+                    idx = (i + k) * num_frames
+                    chunk = torch.stack(whisper_chunks[idx : idx + num_frames])
+                    audio_embeds_list.append(chunk)
+                audio_embeds = torch.cat(audio_embeds_list, dim=0)
+                audio_embeds = audio_embeds.to(device, dtype=weight_dtype)
+                if do_classifier_free_guidance:
+                    empty_audio_embeds = torch.zeros_like(audio_embeds)
+                    audio_embeds = torch.cat([empty_audio_embeds, audio_embeds])
+            else:
+                audio_embeds = None
+
+            # Slice video frames for the bs chunks
+            inference_video_frames = video_frames[i * num_frames : (i + bs) * num_frames]
+            
+            # Slice and reshape latents: shape (bs, c, f, h, w)
+            latents = all_latents[:, :, i * num_frames : (i + bs) * num_frames]
+            latents = rearrange(latents, "1 c (b f) h w -> b c f h w", b=bs, f=num_frames)
+
+            # VAE encoding and mask preparation for the bs chunks (returns shape (bs * f, ...))
+            pixel_values, masked_pixel_values, masks = self.image_processor.prepare_masks_and_masked_images(
+                inference_video_frames, affine_transform=False
+            )
+
+            # 7. Prepare mask latent variables
+            mask_latents, masked_image_latents = self.prepare_mask_latents(
+                masks,
+                masked_pixel_values,
+                height,
+                width,
+                weight_dtype,
+                device,
+                generator,
+                do_classifier_free_guidance,
+            )
+
+            # Reshape mask_latents and masked_image_latents to (bs or 2 * bs, c, f, h, w)
+            if do_classifier_free_guidance:
+                mask_uncond, mask_cond = mask_latents.chunk(2, dim=0)
+                mask_uncond = rearrange(mask_uncond, "1 c (b f) h w -> b c f h w", b=bs, f=num_frames)
+                mask_cond = rearrange(mask_cond, "1 c (b f) h w -> b c f h w", b=bs, f=num_frames)
+                mask_latents = torch.cat([mask_uncond, mask_cond], dim=0)
+
+                mi_uncond, mi_cond = masked_image_latents.chunk(2, dim=0)
+                mi_uncond = rearrange(mi_uncond, "1 c (b f) h w -> b c f h w", b=bs, f=num_frames)
+                mi_cond = rearrange(mi_cond, "1 c (b f) h w -> b c f h w", b=bs, f=num_frames)
+                masked_image_latents = torch.cat([mi_uncond, mi_cond], dim=0)
+            else:
+                mask_latents = rearrange(mask_latents, "1 c (b f) h w -> b c f h w", b=bs, f=num_frames)
+                masked_image_latents = rearrange(masked_image_latents, "1 c (b f) h w -> b c f h w", b=bs, f=num_frames)
+
+            # 8. Prepare image latents
+            image_latents = self.prepare_image_latents(
+                pixel_values,
+                device,
+                weight_dtype,
+                generator,
+                do_classifier_free_guidance,
+            )
+
+            if do_classifier_free_guidance:
+                il_uncond, il_cond = image_latents.chunk(2, dim=0)
+                il_uncond = rearrange(il_uncond, "1 c (b f) h w -> b c f h w", b=bs, f=num_frames)
+                il_cond = rearrange(il_cond, "1 c (b f) h w -> b c f h w", b=bs, f=num_frames)
+                image_latents = torch.cat([il_uncond, il_cond], dim=0)
+            else:
+                image_latents = rearrange(image_latents, "1 c (b f) h w -> b c f h w", b=bs, f=num_frames)
+
+            # 9. Denoising loop
+            num_warmup_steps = len(timesteps) - num_inference_steps * self.scheduler.order
+            with self.progress_bar(total=num_inference_steps) as progress_bar:
+                for j, t in enumerate(timesteps):
+                    # expand the latents if we are doing classifier free guidance
+                    latent_model_input = torch.cat([latents] * 2) if do_classifier_free_guidance else latents
+
+                    # concat latents, mask, masked_image_latents in the channel dimension
+                    latent_model_input = self.scheduler.scale_model_input(latent_model_input, t)
+                    latent_model_input = torch.cat(
+                        [latent_model_input, mask_latents, masked_image_latents, image_latents], dim=1
+                    )
+
+                    # predict the noise residual
+                    noise_pred = self.unet(latent_model_input, t, encoder_hidden_states=audio_embeds).sample
+
+                    # perform guidance
+                    if do_classifier_free_guidance:
+                        noise_pred_uncond, noise_pred_audio = noise_pred.chunk(2, dim=0)
+                        noise_pred = noise_pred_uncond + guidance_scale * (noise_pred_audio - noise_pred_uncond)
+
+                    # compute the previous noisy sample x_t -> x_t-1
+                    latents = self.scheduler.step(noise_pred, t, latents, **extra_step_kwargs).prev_sample
+
+                    # call the callback, if provided
+                    if j == len(timesteps) - 1 or ((j + 1) > num_warmup_steps and (j + 1) % self.scheduler.order == 0):
+                        progress_bar.update()
+                        if callback is not None and j % callback_steps == 0:
+                            callback(j, t, latents)
+
+            # Recover the pixel values
+            decoded_latents = self.decode_latents(latents)
+            decoded_latents = self.paste_surrounding_pixels_back(
+                decoded_latents, pixel_values, 1 - masks, device, weight_dtype
+            )
+            synced_video_frames.append(decoded_latents)
+            masked_video_frames.append(masked_pixel_values)
+
+        synced_video_frames = self.restore_video(
+            torch.cat(synced_video_frames), original_video_frames, boxes, affine_matrices
+        )
+        masked_video_frames = self.restore_video(
+            torch.cat(masked_video_frames), original_video_frames, boxes, affine_matrices
+        )
+
+        audio_samples_remain_length = int(synced_video_frames.shape[0] / video_fps * audio_sample_rate)
+        audio_samples = audio_samples[:audio_samples_remain_length].cpu().numpy()
+
+        if is_train:
+            self.unet.train()
+
+        temp_dir = "temp"
+        if os.path.exists(temp_dir):
+            shutil.rmtree(temp_dir)
+        os.makedirs(temp_dir, exist_ok=True)
+
+        write_video(os.path.join(temp_dir, "video.mp4"), synced_video_frames, fps=25)
+
+        sf.write(os.path.join(temp_dir, "audio.wav"), audio_samples, audio_sample_rate)
+
+        command = f"ffmpeg -y -loglevel error -nostdin -i {os.path.join(temp_dir, 'video.mp4')} -i {os.path.join(temp_dir, 'audio.wav')} -c:v libx264 -c:a aac -q:v 0 -q:a 0 {video_out_path}"
+        subprocess.run(command, shell=True)
+
+    latentsync.pipelines.lipsync_pipeline.LipsyncPipeline.__call__ = batched_call
+
 except ImportError as e:
     print(f"Warning: Could not import LatentSync dependencies: {e}. Running in stub/compatibility mode.", flush=True)
     _LATENTSYNC_AVAILABLE = False
@@ -479,7 +706,7 @@ def detect_video_occlusion(video_path):
     return occlusions
 
 
-def run_latentsync(video_path, audio_path, inference_steps, guidance_scale, seed, deepcache_interval):
+def run_latentsync(video_path, audio_path, inference_steps, guidance_scale, seed, deepcache_interval, batch_size=4):
     global CURRENT_FRAME_COUNTER, CURRENT_OCCLUSION_MASK, LAST_VALID_BBOX, LAST_VALID_LMK
     CURRENT_FRAME_COUNTER = 0
     LAST_VALID_BBOX = None
@@ -497,7 +724,7 @@ def run_latentsync(video_path, audio_path, inference_steps, guidance_scale, seed
     temp_dir = f"{CACHE}/temp_{uuid.uuid4().hex[:8]}"
     os.makedirs(temp_dir, exist_ok=True)
 
-    print(f"[latentsync] starting native pipeline inference: steps={inference_steps}, guidance={guidance_scale}, seed={seed}, deepcache_interval={deepcache_interval}", flush=True)
+    print(f"[latentsync] starting native pipeline inference: steps={inference_steps}, guidance={guidance_scale}, seed={seed}, deepcache_interval={deepcache_interval}, batch_size={batch_size}", flush=True)
 
     # Set seed for reproducibility
     torch.manual_seed(seed)
@@ -544,6 +771,7 @@ def run_latentsync(video_path, audio_path, inference_steps, guidance_scale, seed
             height=CONFIG.data.resolution,
             mask_image_path=CONFIG.data.mask_image_path,
             temp_dir=temp_dir,
+            batch_size=batch_size,
         )
     finally:
         stop.set()
@@ -618,16 +846,18 @@ def handler(event):
         return_mode = job_input.get("return_mode", "url")
         r2_key = job_input.get("r2_key") or f"lawyerdigest/anchor/anchor_synced_{int(time.time())}.mp4"
 
-        # default_steps and default_deepcache from env or hard defaults
+        # default_steps, default_deepcache, and default_batch_size from env or hard defaults
         default_steps = int(os.environ.get("DEFAULT_INFERENCE_STEPS", 20))
         default_cache = int(os.environ.get("DEFAULT_DEEPCACHE_INTERVAL", 3))
+        default_batch_size = int(os.environ.get("DEFAULT_INFERENCE_BATCH_SIZE", 4))
 
         inference_steps = max(10, min(50, int(job_input.get("inference_steps", default_steps))))
         deepcache_interval = max(1, min(10, int(job_input.get("deepcache_interval", default_cache))))
+        batch_size = max(1, min(16, int(job_input.get("batch_size", default_batch_size))))
         guidance_scale = max(1.0, min(3.0, float(job_input.get("guidance_scale", 1.5))))
         seed = int(job_input.get("seed") or random.randint(1, 10**6))
 
-        print(f"[{job_id}] mode={return_mode} steps={inference_steps} guidance={guidance_scale} seed={seed} deepcache_interval={deepcache_interval}", flush=True)
+        print(f"[{job_id}] mode={return_mode} steps={inference_steps} guidance={guidance_scale} seed={seed} deepcache_interval={deepcache_interval} batch_size={batch_size}", flush=True)
 
         print(f"[{job_id}] Downloading inputs...", flush=True)
         video_path = download_or_decode(video_src, "mp4")
@@ -653,7 +883,7 @@ def handler(event):
 
         print(f"[{job_id}] Running LatentSync...", flush=True)
         t1 = time.time()
-        synced = run_latentsync(video_path, audio_path, inference_steps, guidance_scale, seed, deepcache_interval)
+        synced = run_latentsync(video_path, audio_path, inference_steps, guidance_scale, seed, deepcache_interval, batch_size)
         print(f"[{job_id}] LatentSync done in {time.time()-t1:.1f}s", flush=True)
 
         final = merge_clean_audio(synced, audio_path)
